@@ -1,151 +1,103 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import altair as alt
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+# Enable full rendering
+alt.data_transformers.enable('vegafusion')
+alt.data_transformers.enable('default', max_rows=100000)
+
+# Load data
+df = pd.read_csv('listings.csv')
+df['price'] = df['price'].replace('[\$,]', '', regex=True).astype(float)
+
+# --- Sidebar filters ---
+st.sidebar.header("Filter Listings")
+
+# Neighborhood filter
+neighborhoods = sorted(df['neighbourhood_cleansed'].dropna().unique())
+selected_neighborhood = st.sidebar.selectbox("Select a neighborhood", ['All'] + neighborhoods)
+
+# Price slider
+min_price = int(df['price'].min())
+max_price = int(df['price'].max())
+price_range = st.sidebar.slider("Select price range", min_price, min(1000, max_price), (50, 500))
+
+# Filter data based on selections
+filtered_df = df.copy()
+if selected_neighborhood != 'All':
+    filtered_df = filtered_df[filtered_df['neighbourhood_cleansed'] == selected_neighborhood]
+
+filtered_df = filtered_df[(filtered_df['price'] >= price_range[0]) & (filtered_df['price'] <= price_range[1])]
+
+# --- Chart 1: Median Price by Neighborhood ---
+st.subheader("Median Price by Neighborhood")
+price_by_n = df.groupby('neighbourhood_cleansed')['price'].median().reset_index()
+chart1 = alt.Chart(price_by_n).mark_bar().encode(
+    x=alt.X('price:Q', title='Median Nightly Price ($)'),
+    y=alt.Y('neighbourhood_cleansed:N', sort='-x', title='Neighborhood'),
+    tooltip=['neighbourhood_cleansed', 'price']
+).properties(width=600, height=400)
+st.altair_chart(chart1)
+
+# --- Chart 2: Room Type Distribution ---
+st.subheader("Room Type Distribution and Prices")
+room_chart = alt.Chart(filtered_df).mark_boxplot(extent='min-max').encode(
+    x='room_type:N',
+    y='price:Q',
+    color='room_type:N'
+).properties(width=400, height=300)
+
+count_chart = alt.Chart(filtered_df).mark_bar(opacity=0.5).encode(
+    x='room_type:N',
+    y='count():Q',
+    color='room_type:N'
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+st.altair_chart(count_chart & room_chart)
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# --- Chart 3: Reviews vs. Revenue with Brushing ---
+st.subheader("Reviews vs. Estimated Revenue (Past Year)")
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
+# Handle missing or extreme values
+filtered_rev = filtered_df[
+    (filtered_df['number_of_reviews'] < 300) &
+    (filtered_df['estimated_revenue_l365d'] < 100000)
 ]
 
-st.header('GDP over time', divider='gray')
+brush = alt.selection_interval()
 
-''
+scatter = alt.Chart(filtered_rev).mark_circle(opacity=0.5).encode(
+    x='number_of_reviews:Q',
+    y='estimated_revenue_l365d:Q',
+    tooltip=['name', 'number_of_reviews', 'estimated_revenue_l365d'],
+    color=alt.condition(brush, alt.value('steelblue'), alt.value('lightgray'))
+).add_params(brush)
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+regression = scatter.transform_regression(
+    'number_of_reviews', 'estimated_revenue_l365d'
+).mark_line(color='red')
+
+st.altair_chart((scatter + regression).properties(width=600, height=400))
+
+# --- Chart 4: Median Price by Host Location ---
+st.subheader("Median Price by Host Location (Top 20 Locations)")
+
+host_prices = df.copy()
+host_prices = host_prices.dropna(subset=['host_location'])
+
+top_locations = host_prices['host_location'].value_counts().nlargest(20).index
+filtered_hosts = host_prices[host_prices['host_location'].isin(top_locations)]
+
+median_price_by_host = filtered_hosts.groupby('host_location')['price'].median().reset_index()
+
+chart4 = alt.Chart(median_price_by_host).mark_bar().encode(
+    x=alt.X('price:Q', title='Median Price ($)'),
+    y=alt.Y('host_location:N', sort='-x', title='Host Location'),
+    tooltip=['host_location', 'price']
+).properties(
+    width=600,
+    height=500,
+    title='Median Airbnb Price by Host Location (Top 20)'
 )
 
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+st.altair_chart(chart4)
